@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import logging
 from datetime import datetime
@@ -30,14 +29,10 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total re
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
 
-# Warning detection regex (set at least one)
-WARNING_SUBJECT_REGEX = os.getenv("WARNING_SUBJECT_REGEX", "").strip()
-WARNING_BODY_REGEX = os.getenv("WARNING_BODY_REGEX", "").strip()
-
-# ✅ Ignore lines (set these in Railway Variables; body ignore removed, subject-only)
-IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip()
-IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip()
-IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip()
+# ✅ Ignore lines
+IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip().lower()
+IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip().lower()
+IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip().lower()
 
 # Redis keys (shared between OTP bot and watcher)
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
@@ -53,11 +48,6 @@ if not ALLOWED_DOMAIN:
     raise SystemExit("ERROR: ALLOWED_DOMAIN is required (comma-separated domains).")
 if not REDIS_URL:
     raise SystemExit("ERROR: REDIS_URL is required (from Railway Redis service).")
-if not WARNING_SUBJECT_REGEX and not WARNING_BODY_REGEX:
-    raise SystemExit("ERROR: Set WARNING_SUBJECT_REGEX and/or WARNING_BODY_REGEX.")
-
-SUBJECT_RE = re.compile(WARNING_SUBJECT_REGEX, re.IGNORECASE) if WARNING_SUBJECT_REGEX else None
-BODY_RE = re.compile(WARNING_BODY_REGEX, re.IGNORECASE) if WARNING_BODY_REGEX else None
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -69,7 +59,10 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
     "Referer": "https://generator.email/",
 }
 
@@ -87,33 +80,17 @@ def _abs_url(href: str) -> str:
         return "https://generator.email" + href
     return "https://generator.email/" + href
 
+def _ignore_lines() -> List[str]:
+    out = []
+    for x in [IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3]:
+        x = (x or "").strip().lower()
+        if x:
+            out.append(x)
+    return out
+
 async def _sleep(seconds: int):
     import asyncio
     await asyncio.sleep(seconds)
-
-
-def _allowed_ignore_lines() -> List[str]:
-    out = []
-    for v in (IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3):
-        vv = (v or "").strip().lower()
-        if vv:
-            out.append(vv)
-    return out
-
-
-def _is_ignored_subject(subject: str) -> bool:
-    """
-    ✅ IMPORTANT:
-    generator.email body/iframe text can contain mixed/cached text.
-    So we only ignore by SUBJECT (reliable).
-    """
-    s = (subject or "").strip().lower()
-    if not s:
-        return False
-    for line in _allowed_ignore_lines():
-        if line in s:
-            return True
-    return False
 
 
 # ---------------- Telegram send (NO polling) ----------------
@@ -167,11 +144,71 @@ async def set_alerted_marker(email: str, marker: str):
 
 
 # ---------------- generator.email scraping ----------------
-def _extract_subject_and_text(html: str) -> Tuple[str, str, BeautifulSoup]:
+def _extract_subject(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    subject = soup.title.get_text(" ", strip=True) if soup.title else ""
-    text = soup.get_text(" ", strip=True)
-    return subject, text, soup
+    return soup.title.get_text(" ", strip=True) if soup.title else ""
+
+def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
+    """
+    ✅ CRITICAL FIX:
+    generator.email inbox pages contain sidebar/table with OTHER subjects.
+    We must extract ONLY the email body container, not whole page text.
+    """
+    # Try common containers (generator.email changes ids sometimes)
+    selectors = [
+        {"id": "email-body"},
+        {"id": "emailbody"},
+        {"id": "email_content"},
+        {"id": "email-content"},
+        {"id": "messagebody"},
+        {"id": "emailMessage"},
+        {"id": "mail"},
+        {"id": "content"},
+    ]
+
+    for sel in selectors:
+        node = soup.find(id=sel["id"])
+        if node:
+            return node.get_text(" ", strip=True)
+
+    # Try common classes
+    class_candidates = [
+        "email-body",
+        "emailbody",
+        "email-content",
+        "message-body",
+        "mailview",
+        "content",
+    ]
+    for cls in class_candidates:
+        node = soup.find(class_=cls)
+        if node:
+            return node.get_text(" ", strip=True)
+
+    # Fallback: try the biggest <pre> or <article> block if present
+    pres = soup.find_all("pre")
+    if pres:
+        biggest = max(pres, key=lambda x: len(x.get_text(" ", strip=True)))
+        txt = biggest.get_text(" ", strip=True)
+        if txt:
+            return txt
+
+    articles = soup.find_all("article")
+    if articles:
+        biggest = max(articles, key=lambda x: len(x.get_text(" ", strip=True)))
+        txt = biggest.get_text(" ", strip=True)
+        if txt:
+            return txt
+
+    # Last resort (not ideal)
+    return soup.get_text(" ", strip=True)
+
+def _is_ignored(body_text: str) -> bool:
+    t = (body_text or "").lower()
+    for line in _ignore_lines():
+        if line and line in t:
+            return True
+    return False
 
 async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
     inbox_url = f"https://generator.email/{email}"
@@ -186,7 +223,6 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
         for a in table.find_all("a", href=True):
             links.append(_abs_url(a["href"]))
 
-    # Unique + newest N
     out, seen = [], set()
     for u in links:
         if u not in seen:
@@ -195,32 +231,33 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
 
     return out[:SCAN_LAST_N]
 
-async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[bool, str]:
-    r = await client.get(msg_url, headers={**HEADERS, "Referer": "https://generator.email/"})
+async def fetch_message_subject_and_body(client: httpx.AsyncClient, inbox_url: str, msg_url: str) -> Tuple[str, str, str]:
+    """
+    Returns: subject, body_text, final_url
+    final_url is important because msg_url redirects to /inboxX/
+    """
+    r = await client.get(msg_url, headers={**HEADERS, "Referer": inbox_url})
     r.raise_for_status()
 
-    subject, text, soup = _extract_subject_and_text(r.text)
+    final_url = str(r.url)
+    subject = _extract_subject(r.text)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    # ✅ Ignore ONLY by subject (reliable)
-    if _is_ignored_subject(subject):
-        logger.info(f"ignored email matched ignore lines (subject='{subject}').")
-        return False, subject
-
-    # Include iframe body if present
+    # If message page has iframe, pull iframe and extract body from that
     iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
-        iframe_url = _abs_url(iframe["src"])
-        ir = await client.get(iframe_url, headers={**HEADERS, "Referer": msg_url})
+        iframe_url = _abs_url(iframe["src"].strip())
+        ir = await client.get(iframe_url, headers={**HEADERS, "Referer": final_url})
         ir.raise_for_status()
-        iframe_text = BeautifulSoup(ir.text, "html.parser").get_text(" ", strip=True)
-        text = text + " " + iframe_text
 
-    subj_ok = bool(SUBJECT_RE.search(subject)) if SUBJECT_RE else False
-    body_ok = bool(BODY_RE.search(text)) if BODY_RE else False
+        iframe_soup = BeautifulSoup(ir.text, "html.parser")
+        body_text = _extract_email_body_text_from_page(iframe_soup)
+        return subject, body_text, final_url
 
-    # Either match is enough
-    ok = subj_ok or body_ok
-    return ok, subject
+    # Otherwise extract body from this page (but only body container)
+    body_text = _extract_email_body_text_from_page(soup)
+    return subject, body_text, final_url
+
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
@@ -228,6 +265,8 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
       ("WARNING", marker_url, subject)
       ("NO_WARNING", None, None)
     """
+    inbox_url = f"https://generator.email/{email}"
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
         links = await fetch_inbox_message_links(client, email)
 
@@ -235,9 +274,14 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
             return "NO_WARNING", None, None
 
         for msg_url in links:
-            ok, subject = await message_is_warning(client, msg_url)
-            if ok:
-                return "WARNING", msg_url, subject
+            subject, body_text, final_url = await fetch_message_subject_and_body(client, inbox_url, msg_url)
+
+            if _is_ignored(body_text):
+                logger.info(f"[{email}] ignored email matched ignore lines (subject='{subject}').")
+                continue
+
+            # ✅ Anything not ignored => WARNING
+            return "WARNING", final_url, subject
 
         return "NO_WARNING", None, None
 
@@ -308,6 +352,7 @@ async def run_cycle():
         await set_alerted_marker(email, marker)
         logger.info(f"[{email}] alerted admins.")
 
+
 async def main_loop():
     while True:
         try:
@@ -319,6 +364,7 @@ async def main_loop():
         sleep_s = max(1, interval) * 60
         logger.info(f"Cycle done. Sleeping {sleep_s}s (interval={interval}m).")
         await _sleep(sleep_s)
+
 
 if __name__ == "__main__":
     import asyncio
