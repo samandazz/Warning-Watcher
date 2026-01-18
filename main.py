@@ -243,14 +243,9 @@ async def run_cycle():
     for email in emails:
         confirmed, status, marker, subject = await check_email_with_retry(email)
 
+        # ✅ FIXED: Do NOT notify admins on network issues; just log and retry next cycle.
         if not confirmed:
-            # Not silently skipped
-            await alert_admins(
-                "⚠️ WARNING WATCHER: Could not confirm inbox due to network issues.\n"
-                f"📧 {email}\n"
-                f"⏱️ Budget: {RETRY_BUDGET_SECONDS}s\n"
-                f"🕒 {datetime.now().isoformat()}"
-            )
+            logger.warning(f"[{email}] could not confirm inbox due to network issues; will retry next cycle.")
             continue
 
         if status == "NO_WARNING":
