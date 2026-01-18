@@ -15,37 +15,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("warning-watcher")
 
-# ---------------- ENV ----------------
+# ---------------- ENV (Railway Variables) ----------------
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 ALLOWED_DOMAIN = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAIN", "").split(",") if d.strip()]
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
-DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))  # fallback if redis key not set
-RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # per email confirm budget
-RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # between retries
-SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N messages
+# Interval (minutes): watcher reads from Redis key first, otherwise uses DEFAULT_INTERVAL_MIN
+DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
 
-# Set at least one of these regex to match the warning email.
+# Network retry behavior (per email)
+RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total retry time per email
+RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
+SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
+
+# Warning detection regex (set at least one)
 WARNING_SUBJECT_REGEX = os.getenv("WARNING_SUBJECT_REGEX", "").strip()
 WARNING_BODY_REGEX = os.getenv("WARNING_BODY_REGEX", "").strip()
 
-# Redis keys
-WATCHLIST_KEY = "warn:watchlist"          # Set of emails
-INTERVAL_KEY = "warn:interval_min"        # String number
-ALERTED_PREFIX = "warn:alerted:"          # String marker per email
+# Redis keys (shared between OTP bot and watcher)
+WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
+INTERVAL_KEY = "warn:interval_min"        # Redis STRING interval minutes
+ALERTED_PREFIX = "warn:alerted:"          # Redis STRING per email storing last alerted marker
 
+# ---------------- Validation ----------------
 if not TG_TOKEN:
-    raise SystemExit("ERROR: TG_TOKEN is required")
+    raise SystemExit("ERROR: TG_TOKEN is required (Railway variable).")
 if not ADMIN_IDS:
-    raise SystemExit("ERROR: ADMIN_IDS is required")
+    raise SystemExit("ERROR: ADMIN_IDS is required (comma-separated Telegram IDs).")
 if not ALLOWED_DOMAIN:
-    raise SystemExit("ERROR: ALLOWED_DOMAIN is required")
+    raise SystemExit("ERROR: ALLOWED_DOMAIN is required (comma-separated domains).")
 if not REDIS_URL:
-    raise SystemExit("ERROR: REDIS_URL is required")
+    raise SystemExit("ERROR: REDIS_URL is required (from Railway Redis service).")
 if not WARNING_SUBJECT_REGEX and not WARNING_BODY_REGEX:
-    raise SystemExit("ERROR: Set WARNING_SUBJECT_REGEX and/or WARNING_BODY_REGEX")
+    raise SystemExit("ERROR: Set WARNING_SUBJECT_REGEX and/or WARNING_BODY_REGEX.")
 
 SUBJECT_RE = re.compile(WARNING_SUBJECT_REGEX, re.IGNORECASE) if WARNING_SUBJECT_REGEX else None
 BODY_RE = re.compile(WARNING_BODY_REGEX, re.IGNORECASE) if WARNING_BODY_REGEX else None
@@ -65,7 +69,7 @@ HEADERS = {
 }
 
 
-# ---------------- Utilities ----------------
+# ---------------- Utils ----------------
 def _is_allowed_domain(email: str) -> bool:
     email = (email or "").strip().lower()
     return any(email.endswith(f"@{d}") for d in ALLOWED_DOMAIN)
@@ -106,7 +110,7 @@ async def alert_admins(text: str):
         await tg_send_message(text, admin_id)
 
 
-# ---------------- Redis read ----------------
+# ---------------- Redis read/write ----------------
 async def get_interval_min() -> int:
     v = await redis_client.get(INTERVAL_KEY)
     if not v:
@@ -146,14 +150,14 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
-    links = []
 
+    links: List[str] = []
     table = soup.find(id="email-table")
     if table:
         for a in table.find_all("a", href=True):
             links.append(_abs_url(a["href"]))
 
-    # Unique + cut to newest N
+    # Unique + newest N
     out, seen = [], set()
     for u in links:
         if u not in seen:
@@ -168,7 +172,7 @@ async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[b
 
     subject, text, soup = _extract_subject_and_text(r.text)
 
-    # Some messages load body in iframe
+    # Include iframe body if present
     iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
         iframe_url = _abs_url(iframe["src"])
@@ -180,17 +184,19 @@ async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[b
     subj_ok = bool(SUBJECT_RE.search(subject)) if SUBJECT_RE else False
     body_ok = bool(BODY_RE.search(text)) if BODY_RE else False
 
-    # If both provided, either match is enough
+    # Either match is enough
     ok = subj_ok or body_ok
     return ok, subject
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Returns:
-      ("WARNING", marker_url, subject) or ("NO_WARNING", None, None)
+      ("WARNING", marker_url, subject)
+      ("NO_WARNING", None, None)
     """
     async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
         links = await fetch_inbox_message_links(client, email)
+
         if not links:
             return "NO_WARNING", None, None
 
@@ -203,8 +209,9 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
 
 async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """
-    confirmed, status, marker, subject
-    If confirmed=False => UNCONFIRMED (network too long)
+    Returns:
+      confirmed, status, marker, subject
+    If confirmed=False => UNCONFIRMED (network issues exceeded budget)
     """
     start = time.time()
     attempt = 0
@@ -224,10 +231,9 @@ async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], 
             await _sleep(RETRY_SLEEP_SECONDS)
 
 
-# ---------------- Main loop ----------------
+# ---------------- Main cycle ----------------
 async def run_cycle():
     emails = await get_watchlist()
-
     if not emails:
         logger.info("Watchlist empty. Nothing to check.")
         return
@@ -238,7 +244,7 @@ async def run_cycle():
         confirmed, status, marker, subject = await check_email_with_retry(email)
 
         if not confirmed:
-            # Not silently skipping
+            # Not silently skipped
             await alert_admins(
                 "⚠️ WARNING WATCHER: Could not confirm inbox due to network issues.\n"
                 f"📧 {email}\n"
@@ -251,10 +257,11 @@ async def run_cycle():
             logger.info(f"[{email}] confirmed: no warning.")
             continue
 
-        # status == WARNING
+        # WARNING found
         marker = marker or f"warning:{email}:{datetime.now().date().isoformat()}"
-
         prev = await get_alerted_marker(email)
+
+        # Deduplicate: if same marker already alerted, do nothing
         if prev == marker:
             logger.info(f"[{email}] warning already alerted (marker unchanged).")
             continue
@@ -272,6 +279,7 @@ async def run_cycle():
         await set_alerted_marker(email, marker)
         logger.info(f"[{email}] alerted admins.")
 
+
 async def main_loop():
     while True:
         try:
@@ -283,6 +291,7 @@ async def main_loop():
         sleep_s = max(1, interval) * 60
         logger.info(f"Cycle done. Sleeping {sleep_s}s (interval={interval}m).")
         await _sleep(sleep_s)
+
 
 if __name__ == "__main__":
     import asyncio
