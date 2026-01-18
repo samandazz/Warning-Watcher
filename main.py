@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 from datetime import datetime
@@ -21,20 +22,27 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 ALLOWED_DOMAIN = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAIN", "").split(",") if d.strip()]
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
+# Interval (minutes): watcher reads from Redis key first, otherwise uses DEFAULT_INTERVAL_MIN
 DEFAULT_INTERVAL_MIN = int(os.getenv("DEFAULT_INTERVAL_MIN", "30"))
 
-RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))
-RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))
-SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "10"))
+# Network retry behavior (per email)
+RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total retry time per email
+RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
+SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
 
-# ✅ Ignore lines (exact fragments)
-IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip().lower()
-IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip().lower()
-IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip().lower()
+# Warning detection regex (set at least one)
+WARNING_SUBJECT_REGEX = os.getenv("WARNING_SUBJECT_REGEX", "").strip()
+WARNING_BODY_REGEX = os.getenv("WARNING_BODY_REGEX", "").strip()
 
-WATCHLIST_KEY = "warn:watchlist"
-INTERVAL_KEY = "warn:interval_min"
-ALERTED_PREFIX = "warn:alerted:"  # per email last alerted message url
+# ✅ Ignore lines (set these in Railway Variables; body ignore removed, subject-only)
+IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip()
+IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip()
+IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip()
+
+# Redis keys (shared between OTP bot and watcher)
+WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
+INTERVAL_KEY = "warn:interval_min"        # Redis STRING interval minutes
+ALERTED_PREFIX = "warn:alerted:"          # Redis STRING per email storing last alerted marker
 
 # ---------------- Validation ----------------
 if not TG_TOKEN:
@@ -45,6 +53,11 @@ if not ALLOWED_DOMAIN:
     raise SystemExit("ERROR: ALLOWED_DOMAIN is required (comma-separated domains).")
 if not REDIS_URL:
     raise SystemExit("ERROR: REDIS_URL is required (from Railway Redis service).")
+if not WARNING_SUBJECT_REGEX and not WARNING_BODY_REGEX:
+    raise SystemExit("ERROR: Set WARNING_SUBJECT_REGEX and/or WARNING_BODY_REGEX.")
+
+SUBJECT_RE = re.compile(WARNING_SUBJECT_REGEX, re.IGNORECASE) if WARNING_SUBJECT_REGEX else None
+BODY_RE = re.compile(WARNING_BODY_REGEX, re.IGNORECASE) if WARNING_BODY_REGEX else None
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -56,10 +69,7 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
     "Referer": "https://generator.email/",
 }
 
@@ -68,14 +78,6 @@ HEADERS = {
 def _is_allowed_domain(email: str) -> bool:
     email = (email or "").strip().lower()
     return any(email.endswith(f"@{d}") for d in ALLOWED_DOMAIN)
-
-def _allowed_ignore_lines() -> List[str]:
-    out = []
-    for x in [IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3]:
-        x = (x or "").strip().lower()
-        if x:
-            out.append(x)
-    return out
 
 def _abs_url(href: str) -> str:
     href = (href or "").strip()
@@ -88,6 +90,30 @@ def _abs_url(href: str) -> str:
 async def _sleep(seconds: int):
     import asyncio
     await asyncio.sleep(seconds)
+
+
+def _allowed_ignore_lines() -> List[str]:
+    out = []
+    for v in (IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3):
+        vv = (v or "").strip().lower()
+        if vv:
+            out.append(vv)
+    return out
+
+
+def _is_ignored_subject(subject: str) -> bool:
+    """
+    ✅ IMPORTANT:
+    generator.email body/iframe text can contain mixed/cached text.
+    So we only ignore by SUBJECT (reliable).
+    """
+    s = (subject or "").strip().lower()
+    if not s:
+        return False
+    for line in _allowed_ignore_lines():
+        if line in s:
+            return True
+    return False
 
 
 # ---------------- Telegram send (NO polling) ----------------
@@ -140,68 +166,61 @@ async def set_alerted_marker(email: str, marker: str):
     await redis_client.set(ALERTED_PREFIX + email, marker)
 
 
-# ---------------- generator.email reading ----------------
-def _extract_subject(html: str) -> str:
+# ---------------- generator.email scraping ----------------
+def _extract_subject_and_text(html: str) -> Tuple[str, str, BeautifulSoup]:
     soup = BeautifulSoup(html, "html.parser")
-    return soup.title.get_text(" ", strip=True) if soup.title else ""
+    subject = soup.title.get_text(" ", strip=True) if soup.title else ""
+    text = soup.get_text(" ", strip=True)
+    return subject, text, soup
 
-async def fetch_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
+async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
     inbox_url = f"https://generator.email/{email}"
     r = await client.get(inbox_url, headers={**HEADERS, "Referer": "https://generator.email/"})
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    links = []
-    email_table = soup.find(id="email-table")
-    if email_table:
-        for a in email_table.find_all("a", href=True):
+    links: List[str] = []
+    table = soup.find(id="email-table")
+    if table:
+        for a in table.find_all("a", href=True):
             links.append(_abs_url(a["href"]))
 
+    # Unique + newest N
     out, seen = [], set()
     for u in links:
         if u not in seen:
             seen.add(u)
             out.append(u)
 
-    return out[:max(1, SCAN_LAST_N)]
+    return out[:SCAN_LAST_N]
 
+async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[bool, str]:
+    r = await client.get(msg_url, headers={**HEADERS, "Referer": "https://generator.email/"})
+    r.raise_for_status()
 
-async def fetch_full_message_text(client: httpx.AsyncClient, msg_url: str, inbox_url: str) -> Tuple[str, str]:
-    """
-    ✅ FIX: Ignore-check must only use REAL email body.
-    generator.email page includes inbox list + other subjects -> false ignore.
-    So:
-      - subject from <title>
-      - body from iframe ONLY if iframe exists
-      - fallback body from page text if no iframe
-    """
-    msg_resp = await client.get(msg_url, headers={**HEADERS, "Referer": inbox_url})
-    msg_resp.raise_for_status()
+    subject, text, soup = _extract_subject_and_text(r.text)
 
-    subject = _extract_subject(msg_resp.text)
-    msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
+    # ✅ Ignore ONLY by subject (reliable)
+    if _is_ignored_subject(subject):
+        logger.info(f"ignored email matched ignore lines (subject='{subject}').")
+        return False, subject
 
-    iframe = msg_soup.find("iframe", src=True)
+    # Include iframe body if present
+    iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
-        iframe_url = _abs_url(iframe["src"].strip())
-        iframe_resp = await client.get(iframe_url, headers={**HEADERS, "Referer": msg_url})
-        iframe_resp.raise_for_status()
-        body_text = BeautifulSoup(iframe_resp.text, "html.parser").get_text(" ", strip=True)
-        return subject, body_text
+        iframe_url = _abs_url(iframe["src"])
+        ir = await client.get(iframe_url, headers={**HEADERS, "Referer": msg_url})
+        ir.raise_for_status()
+        iframe_text = BeautifulSoup(ir.text, "html.parser").get_text(" ", strip=True)
+        text = text + " " + iframe_text
 
-    # fallback (rare): no iframe
-    body_text = msg_soup.get_text(" ", strip=True)
-    return subject, body_text
+    subj_ok = bool(SUBJECT_RE.search(subject)) if SUBJECT_RE else False
+    body_ok = bool(BODY_RE.search(text)) if BODY_RE else False
 
-
-def is_ignored_email(body_text: str) -> bool:
-    t = (body_text or "").lower()
-    for line in _allowed_ignore_lines():
-        if line and line in t:
-            return True
-    return False
-
+    # Either match is enough
+    ok = subj_ok or body_ok
+    return ok, subject
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
@@ -209,27 +228,25 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
       ("WARNING", marker_url, subject)
       ("NO_WARNING", None, None)
     """
-    inbox_url = f"https://generator.email/{email}"
-
     async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
-        links = await fetch_message_links(client, email)
+        links = await fetch_inbox_message_links(client, email)
 
         if not links:
             return "NO_WARNING", None, None
 
         for msg_url in links:
-            subject, body_text = await fetch_full_message_text(client, msg_url, inbox_url)
-
-            if is_ignored_email(body_text):
-                logger.info(f"[{email}] ignored email matched ignore lines (subject='{subject}').")
-                continue
-
-            return "WARNING", msg_url, subject
+            ok, subject = await message_is_warning(client, msg_url)
+            if ok:
+                return "WARNING", msg_url, subject
 
         return "NO_WARNING", None, None
 
-
 async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
+    """
+    Returns:
+      confirmed, status, marker, subject
+    If confirmed=False => UNCONFIRMED (network issues exceeded budget)
+    """
     start = time.time()
     attempt = 0
 
@@ -260,7 +277,7 @@ async def run_cycle():
     for email in emails:
         confirmed, status, marker, subject = await check_email_with_retry(email)
 
-        # ✅ do not message admins for network errors
+        # ✅ Do NOT notify admins on network issues; just log and retry next cycle.
         if not confirmed:
             logger.warning(f"[{email}] could not confirm inbox due to network issues; will retry next cycle.")
             continue
@@ -269,8 +286,11 @@ async def run_cycle():
             logger.info(f"[{email}] confirmed: no warning.")
             continue
 
+        # WARNING found
         marker = marker or f"warning:{email}:{datetime.now().date().isoformat()}"
         prev = await get_alerted_marker(email)
+
+        # Deduplicate: if same marker already alerted, do nothing
         if prev == marker:
             logger.info(f"[{email}] warning already alerted (marker unchanged).")
             continue
@@ -288,7 +308,6 @@ async def run_cycle():
         await set_alerted_marker(email, marker)
         logger.info(f"[{email}] alerted admins.")
 
-
 async def main_loop():
     while True:
         try:
@@ -300,7 +319,6 @@ async def main_loop():
         sleep_s = max(1, interval) * 60
         logger.info(f"Cycle done. Sleeping {sleep_s}s (interval={interval}m).")
         await _sleep(sleep_s)
-
 
 if __name__ == "__main__":
     import asyncio
