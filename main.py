@@ -29,7 +29,7 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total re
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
 
-# ✅ NEW: Ignore phrases (3 variables) - if any phrase is found in subject/body => IGNORE mail
+# ✅ Ignore phrases (3 variables) - if any phrase is found in subject/body => IGNORE mail
 IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip()
 IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip()
 IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip()
@@ -165,8 +165,8 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
 
     return out[:SCAN_LAST_N]
 
-def _should_ignore(subject: str, text: str) -> bool:
-    combined = f"{subject} {text}".lower()
+def _should_ignore_text(subject: str, body_text: str) -> bool:
+    combined = f"{subject} {body_text}".lower()
     for line in IGNORE_LINES:
         if line and line.lower() in combined:
             return True
@@ -176,19 +176,38 @@ async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[b
     r = await client.get(msg_url, headers={**HEADERS, "Referer": "https://generator.email/"})
     r.raise_for_status()
 
-    subject, text, soup = _extract_subject_and_text(r.text)
+    subject, full_page_text, soup = _extract_subject_and_text(r.text)
 
-    # Include iframe body if present
+    # ✅ FIX: use ONLY the actual email body (iframe if exists), NOT the whole page text
+    body_text = ""
+
+    # Try iframe first (most reliable)
     iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
         iframe_url = _abs_url(iframe["src"])
         ir = await client.get(iframe_url, headers={**HEADERS, "Referer": msg_url})
         ir.raise_for_status()
-        iframe_text = BeautifulSoup(ir.text, "html.parser").get_text(" ", strip=True)
-        text = text + " " + iframe_text
+        body_text = BeautifulSoup(ir.text, "html.parser").get_text(" ", strip=True)
 
-    # ✅ FIXED: Ignore known normal emails by exact lines/phrases
-    if _should_ignore(subject, text):
+    # Fallback: try common “message body” containers (avoid taking whole page)
+    if not body_text:
+        for sel in [
+            soup.find(id="email-content"),
+            soup.find(id="message-body"),
+            soup.find(class_="email-content"),
+            soup.find(class_="message-body"),
+            soup.find("article"),
+        ]:
+            if sel:
+                body_text = sel.get_text(" ", strip=True)
+                break
+
+    # Final fallback if nothing found
+    if not body_text:
+        body_text = full_page_text
+
+    # ✅ Ignore check based on subject + body only
+    if _should_ignore_text(subject, body_text):
         return False, subject
 
     # ✅ Any email not ignored => WARNING
@@ -249,7 +268,7 @@ async def run_cycle():
     for email in emails:
         confirmed, status, marker, subject = await check_email_with_retry(email)
 
-        # ✅ FIXED: Do NOT notify admins on network issues; just log and retry next cycle.
+        # ✅ Do NOT notify admins on network issues; just log and retry next cycle.
         if not confirmed:
             logger.warning(f"[{email}] could not confirm inbox due to network issues; will retry next cycle.")
             continue
