@@ -281,7 +281,8 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
                 continue
 
             # ✅ Anything not ignored => WARNING
-            return "WARNING", final_url, subject
+            return "WARNING", inbox_url, subject
+
 
         return "NO_WARNING", None, None
 
