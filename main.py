@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import logging
 from datetime import datetime
@@ -28,7 +27,7 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "10"))
 
-# ✅ Ignore lines (exact text fragments)
+# ✅ Ignore lines (exact fragments)
 IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip().lower()
 IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip().lower()
 IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip().lower()
@@ -141,17 +140,12 @@ async def set_alerted_marker(email: str, marker: str):
     await redis_client.set(ALERTED_PREFIX + email, marker)
 
 
-# ---------------- generator.email reading (SAME AS OTP LOGIC) ----------------
-def _extract_text(html: str) -> Tuple[str, str, BeautifulSoup]:
+# ---------------- generator.email reading ----------------
+def _extract_subject(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    subject = soup.title.get_text(" ", strip=True) if soup.title else ""
-    text = soup.get_text(" ", strip=True)
-    return subject, text, soup
+    return soup.title.get_text(" ", strip=True) if soup.title else ""
 
 async def fetch_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
-    """
-    Read inbox page and return newest message links from email-table.
-    """
     inbox_url = f"https://generator.email/{email}"
     r = await client.get(inbox_url, headers={**HEADERS, "Referer": "https://generator.email/"})
     r.raise_for_status()
@@ -164,7 +158,6 @@ async def fetch_message_links(client: httpx.AsyncClient, email: str) -> List[str
         for a in email_table.find_all("a", href=True):
             links.append(_abs_url(a["href"]))
 
-    # newest first, unique
     out, seen = [], set()
     for u in links:
         if u not in seen:
@@ -173,34 +166,37 @@ async def fetch_message_links(client: httpx.AsyncClient, email: str) -> List[str
 
     return out[:max(1, SCAN_LAST_N)]
 
+
 async def fetch_full_message_text(client: httpx.AsyncClient, msg_url: str, inbox_url: str) -> Tuple[str, str]:
     """
-    SAME flow as OTP bot:
-    - open message page
-    - parse text
-    - if iframe exists, fetch iframe and append text
+    ✅ FIX: Ignore-check must only use REAL email body.
+    generator.email page includes inbox list + other subjects -> false ignore.
+    So:
+      - subject from <title>
+      - body from iframe ONLY if iframe exists
+      - fallback body from page text if no iframe
     """
     msg_resp = await client.get(msg_url, headers={**HEADERS, "Referer": inbox_url})
     msg_resp.raise_for_status()
 
-    subject, text, soup = _extract_text(msg_resp.text)
+    subject = _extract_subject(msg_resp.text)
+    msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
 
-    iframe = soup.find("iframe", src=True)
+    iframe = msg_soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
         iframe_url = _abs_url(iframe["src"].strip())
         iframe_resp = await client.get(iframe_url, headers={**HEADERS, "Referer": msg_url})
         iframe_resp.raise_for_status()
-        iframe_text = BeautifulSoup(iframe_resp.text, "html.parser").get_text(" ", strip=True)
-        text = text + " " + iframe_text
+        body_text = BeautifulSoup(iframe_resp.text, "html.parser").get_text(" ", strip=True)
+        return subject, body_text
 
-    return subject, text
+    # fallback (rare): no iframe
+    body_text = msg_soup.get_text(" ", strip=True)
+    return subject, body_text
 
 
-def is_ignored_email(text: str) -> bool:
-    """
-    If any ignore line is found inside the email text => ignore
-    """
-    t = (text or "").lower()
+def is_ignored_email(body_text: str) -> bool:
+    t = (body_text or "").lower()
     for line in _allowed_ignore_lines():
         if line and line in t:
             return True
@@ -221,25 +217,19 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
         if not links:
             return "NO_WARNING", None, None
 
-        # Check newest N messages; if ANY is not ignored => warning
         for msg_url in links:
-            subject, text = await fetch_full_message_text(client, msg_url, inbox_url)
+            subject, body_text = await fetch_full_message_text(client, msg_url, inbox_url)
 
-            if is_ignored_email(text):
+            if is_ignored_email(body_text):
                 logger.info(f"[{email}] ignored email matched ignore lines (subject='{subject}').")
                 continue
 
-            # Not ignored => WARNING
             return "WARNING", msg_url, subject
 
         return "NO_WARNING", None, None
 
 
 async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
-    """
-    confirmed, status, marker, subject
-    confirmed=False means network issues exceeded budget.
-    """
     start = time.time()
     attempt = 0
 
@@ -279,7 +269,6 @@ async def run_cycle():
             logger.info(f"[{email}] confirmed: no warning.")
             continue
 
-        # WARNING found (dedupe)
         marker = marker or f"warning:{email}:{datetime.now().date().isoformat()}"
         prev = await get_alerted_marker(email)
         if prev == marker:
