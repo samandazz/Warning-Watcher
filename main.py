@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import logging
 from datetime import datetime
@@ -30,9 +29,12 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total re
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
 
-# Warning detection regex (set at least one)
-WARNING_SUBJECT_REGEX = os.getenv("WARNING_SUBJECT_REGEX", "").strip()
-WARNING_BODY_REGEX = os.getenv("WARNING_BODY_REGEX", "").strip()
+# ✅ NEW: Ignore phrases (3 variables) - if any phrase is found in subject/body => IGNORE mail
+IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip()
+IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip()
+IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip()
+
+IGNORE_LINES = [x for x in [IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3] if x]
 
 # Redis keys (shared between OTP bot and watcher)
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
@@ -48,11 +50,8 @@ if not ALLOWED_DOMAIN:
     raise SystemExit("ERROR: ALLOWED_DOMAIN is required (comma-separated domains).")
 if not REDIS_URL:
     raise SystemExit("ERROR: REDIS_URL is required (from Railway Redis service).")
-if not WARNING_SUBJECT_REGEX and not WARNING_BODY_REGEX:
-    raise SystemExit("ERROR: Set WARNING_SUBJECT_REGEX and/or WARNING_BODY_REGEX.")
-
-SUBJECT_RE = re.compile(WARNING_SUBJECT_REGEX, re.IGNORECASE) if WARNING_SUBJECT_REGEX else None
-BODY_RE = re.compile(WARNING_BODY_REGEX, re.IGNORECASE) if WARNING_BODY_REGEX else None
+if not IGNORE_LINES:
+    raise SystemExit("ERROR: Set at least one ignore variable: IGNORE_LINE_1 / IGNORE_LINE_2 / IGNORE_LINE_3.")
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -166,6 +165,13 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
 
     return out[:SCAN_LAST_N]
 
+def _should_ignore(subject: str, text: str) -> bool:
+    combined = f"{subject} {text}".lower()
+    for line in IGNORE_LINES:
+        if line and line.lower() in combined:
+            return True
+    return False
+
 async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[bool, str]:
     r = await client.get(msg_url, headers={**HEADERS, "Referer": "https://generator.email/"})
     r.raise_for_status()
@@ -181,12 +187,12 @@ async def message_is_warning(client: httpx.AsyncClient, msg_url: str) -> Tuple[b
         iframe_text = BeautifulSoup(ir.text, "html.parser").get_text(" ", strip=True)
         text = text + " " + iframe_text
 
-    subj_ok = bool(SUBJECT_RE.search(subject)) if SUBJECT_RE else False
-    body_ok = bool(BODY_RE.search(text)) if BODY_RE else False
+    # ✅ FIXED: Ignore known normal emails by exact lines/phrases
+    if _should_ignore(subject, text):
+        return False, subject
 
-    # Either match is enough
-    ok = subj_ok or body_ok
-    return ok, subject
+    # ✅ Any email not ignored => WARNING
+    return True, subject
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
