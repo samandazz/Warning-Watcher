@@ -53,8 +53,9 @@ HEADERS = {
 
 def _normalize_text(text: str) -> str:
     """
-    Removes all newlines, tabs, and extra spaces.
+    CRITICAL FIX: Removes all newlines, tabs, and extra spaces.
     Converts "Hello   \n World" -> "hello world"
+    This ensures your long variables match even if the email has weird formatting.
     """
     if not text:
         return ""
@@ -98,6 +99,7 @@ def _extract_subject(html: str) -> str:
 def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
     """
     Tries specific IDs first. If failing, reads the whole body.
+    Ensures we NEVER return empty string if there is content.
     """
     # 1. Try Specific ID/Class selectors (Best Match)
     selectors = ["email-body", "emailbody", "email_content", "message", "content", "mail"]
@@ -153,68 +155,32 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
     # Remove duplicates, keep order
     return list(dict.fromkeys(links))[:SCAN_LAST_N]
 
-async def fetch_message_content(client: httpx.AsyncClient, msg_url: str, inbox_url: str) -> Tuple[str, str, str]:
-    """
-    Aggressively tries to open the email.
-    If redirected to an inbox (302 found), it updates the Referer and RETRIES immediately.
-    """
-    current_referer = inbox_url
+async def fetch_message_content(client: httpx.AsyncClient, msg_url: str) -> Tuple[str, str, str]:
+    r = await client.get(msg_url, headers=HEADERS)
+    r.raise_for_status()
+    final_url = str(r.url)
+    subject = _extract_subject(r.text)
+    soup = BeautifulSoup(r.text, "html.parser")
     
-    # Try up to 3 times per message if we get bounced
-    for attempt in range(3):
-        headers = {**HEADERS, "Referer": current_referer}
+    # Handle Iframes
+    iframe = soup.find("iframe", src=True)
+    if iframe:
+        iframe_url = _abs_url(iframe["src"])
+        ir = await client.get(iframe_url, headers=HEADERS)
+        body_text = _extract_email_body_text_from_page(BeautifulSoup(ir.text, "html.parser"))
+    else:
+        body_text = _extract_email_body_text_from_page(soup)
         
-        r = await client.get(msg_url, headers=headers)
-        
-        # 1. Check if we failed (Redirected back to Inbox or Home)
-        # If URL contains "/inbox" it means we got kicked out of the message
-        if ("/inbox" in str(r.url) and "generator.email" in str(r.url)) or str(r.url).strip("/") == "https://generator.email":
-            # UPDATE REFERER to the place we landed (e.g. inbox2/)
-            current_referer = str(r.url)
-            # logger.info(f"Redirected by server. Retrying with new Referer: {current_referer}")
-            await _sleep(1) # Small pause before retry
-            continue 
-
-        # 2. If we are here, we are INSIDE the message
-        r.raise_for_status()
-        final_url = str(r.url)
-        subject = _extract_subject(r.text)
-        soup = BeautifulSoup(r.text, "html.parser")
-        
-        # Handle Iframes
-        iframe = soup.find("iframe", src=True)
-        if iframe:
-            iframe_url = _abs_url(iframe["src"])
-            ir = await client.get(iframe_url, headers={**HEADERS, "Referer": final_url})
-            body_text = _extract_email_body_text_from_page(BeautifulSoup(ir.text, "html.parser"))
-        else:
-            body_text = _extract_email_body_text_from_page(soup)
-            
-        return subject, body_text, final_url
-
-    # If loop finishes, we failed 3 times
-    return "Error: Redirected", "", ""
+    return subject, body_text, final_url
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
-    inbox_url = f"https://generator.email/{email}"
-    
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        # 1. Visit Inbox first to set cookies & get real URL
-        r_inbox = await client.get(inbox_url, headers=HEADERS)
-        real_inbox_url = str(r_inbox.url)
-
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
         links = await fetch_inbox_message_links(client, email)
         if not links:
             return "NO_WARNING", None, None
 
         for msg_url in links:
-            # 2. Aggressive Fetch
-            subject, body, final_url = await fetch_message_content(client, msg_url, real_inbox_url)
-
-            # Check if we gave up
-            if subject == "Error: Redirected":
-                logger.error(f"[{email}] Could not open message {msg_url} (Redirect Loop).")
-                continue 
+            subject, body, final_url = await fetch_message_content(client, msg_url)
 
             if _is_ignored(subject, body):
                 continue # This email is safe
