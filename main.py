@@ -154,36 +154,51 @@ async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> Li
     return list(dict.fromkeys(links))[:SCAN_LAST_N]
 
 async def fetch_message_content(client: httpx.AsyncClient, msg_url: str, inbox_url: str) -> Tuple[str, str, str]:
-    # 🔥 CRITICAL FIX: Tell the server we came from the Inbox to avoid 302 Redirects
-    dynamic_headers = {**HEADERS, "Referer": inbox_url}
+    """
+    Aggressively tries to open the email.
+    If redirected to an inbox (302 found), it updates the Referer and RETRIES immediately.
+    """
+    current_referer = inbox_url
     
-    r = await client.get(msg_url, headers=dynamic_headers)
-    
-    # ❌ Redirect Check: If we got kicked back to the inbox, we failed.
-    if "/inbox" in str(r.url) and "generator.email" in str(r.url):
-        return "Error: Redirected", "", str(r.url)
-
-    r.raise_for_status()
-    final_url = str(r.url)
-    subject = _extract_subject(r.text)
-    soup = BeautifulSoup(r.text, "html.parser")
-    
-    # Handle Iframes
-    iframe = soup.find("iframe", src=True)
-    if iframe:
-        iframe_url = _abs_url(iframe["src"])
-        # Update Referer for the iframe too
-        ir = await client.get(iframe_url, headers={**HEADERS, "Referer": final_url})
-        body_text = _extract_email_body_text_from_page(BeautifulSoup(ir.text, "html.parser"))
-    else:
-        body_text = _extract_email_body_text_from_page(soup)
+    # Try up to 3 times per message if we get bounced
+    for attempt in range(3):
+        headers = {**HEADERS, "Referer": current_referer}
         
-    return subject, body_text, final_url
+        r = await client.get(msg_url, headers=headers)
+        
+        # 1. Check if we failed (Redirected back to Inbox or Home)
+        # If URL contains "/inbox" it means we got kicked out of the message
+        if ("/inbox" in str(r.url) and "generator.email" in str(r.url)) or str(r.url).strip("/") == "https://generator.email":
+            # UPDATE REFERER to the place we landed (e.g. inbox2/)
+            current_referer = str(r.url)
+            # logger.info(f"Redirected by server. Retrying with new Referer: {current_referer}")
+            await _sleep(1) # Small pause before retry
+            continue 
+
+        # 2. If we are here, we are INSIDE the message
+        r.raise_for_status()
+        final_url = str(r.url)
+        subject = _extract_subject(r.text)
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        # Handle Iframes
+        iframe = soup.find("iframe", src=True)
+        if iframe:
+            iframe_url = _abs_url(iframe["src"])
+            ir = await client.get(iframe_url, headers={**HEADERS, "Referer": final_url})
+            body_text = _extract_email_body_text_from_page(BeautifulSoup(ir.text, "html.parser"))
+        else:
+            body_text = _extract_email_body_text_from_page(soup)
+            
+        return subject, body_text, final_url
+
+    # If loop finishes, we failed 3 times
+    return "Error: Redirected", "", ""
 
 async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     inbox_url = f"https://generator.email/{email}"
     
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         # 1. Visit Inbox first to set cookies & get real URL
         r_inbox = await client.get(inbox_url, headers=HEADERS)
         real_inbox_url = str(r_inbox.url)
@@ -193,12 +208,12 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
             return "NO_WARNING", None, None
 
         for msg_url in links:
-            # 2. Pass real_inbox_url as the Referer
+            # 2. Aggressive Fetch
             subject, body, final_url = await fetch_message_content(client, msg_url, real_inbox_url)
 
-            # Skip if the site blocked us
+            # Check if we gave up
             if subject == "Error: Redirected":
-                logger.warning(f"[{email}] Skipped a message due to 302 Redirect.")
+                logger.error(f"[{email}] Could not open message {msg_url} (Redirect Loop).")
                 continue 
 
             if _is_ignored(subject, body):
