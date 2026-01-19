@@ -227,10 +227,11 @@ async def run_cycle():
             continue 
 
         msg = (
-            f"🚨 ACCOUNT WARNING 🚨\n"
-            f"📧 {email}\n"
-            f"📝 Subject: {subject}\n"
-            f"🔗 https://generator.email/{email}
+            f"🚨 <b>ACCOUNT WARNING</b> 🚨\n"
+            f"📧 <code>{email}</code>\n"
+            f"📝 <b>Subject:</b> {subject}\n"
+            f"🔗 <a href='{url}'>View Email</a>\n"
+            f"🔗 <a href='https://generator.email/{email}'>Open Inbox</a>"
         )
         
         await alert_admins(msg)
