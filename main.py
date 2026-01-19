@@ -202,7 +202,6 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
             if txt:
                 return txt
 
-    # Fallback: biggest <pre>
     pres = soup.find_all("pre")
     if pres:
         biggest = max(pres, key=lambda x: len(x.get_text(" ", strip=True)))
@@ -210,7 +209,6 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         if txt:
             return txt
 
-    # Fallback: biggest <article>
     articles = soup.find_all("article")
     if articles:
         biggest = max(articles, key=lambda x: len(x.get_text(" ", strip=True)))
@@ -218,16 +216,15 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         if txt:
             return txt
 
-    # LAST resort: return empty instead of whole page
-    # because whole-page text includes sidebar and causes false ignores.
     return ""
 
-def _is_ignored(body_text: str) -> bool:
-    t = (body_text or "").lower()
-    if not t:
+def _is_ignored(subject: str, body_text: str) -> bool:
+    # ✅ FIX: check subject + body together
+    combined = ((subject or "") + " " + (body_text or "")).lower()
+    if not combined.strip():
         return False
     for line in _ignore_lines():
-        if line and line in t:
+        if line and line in combined:
             return True
     return False
 
@@ -264,7 +261,6 @@ async def fetch_message_subject_and_body(client: httpx.AsyncClient, inbox_url: s
     subject = _extract_subject(r.text)
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # If message page has iframe, pull iframe and extract body from that
     iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
         iframe_url = _abs_url(iframe["src"].strip())
@@ -275,7 +271,6 @@ async def fetch_message_subject_and_body(client: httpx.AsyncClient, inbox_url: s
         body_text = _extract_email_body_text_from_page(iframe_soup)
         return subject, body_text, final_url
 
-    # Otherwise extract body from this page (body container only)
     body_text = _extract_email_body_text_from_page(soup)
     return subject, body_text, final_url
 
@@ -301,14 +296,12 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
         for msg_url in links:
             subject, body_text, final_url = await fetch_message_subject_and_body(client, inbox_url, msg_url)
 
-            if _is_ignored(body_text):
+            if _is_ignored(subject, body_text):
                 logger.info(f"[{email}] ignored email matched ignore lines (subject='{subject}').")
                 continue
 
-            # ✅ Found one email among first N that is NOT ignored => WARNING
             return "WARNING", final_url, subject
 
-        # ✅ If we reached here: ALL first N emails were ignored
         logger.info(f"[{email}] all first {len(links)} emails matched ignore lines. NO WARNING.")
         return "NO_WARNING", None, None
 
@@ -349,7 +342,6 @@ async def run_cycle():
     for email in emails:
         confirmed, status, marker, subject = await check_email_with_retry(email)
 
-        # Do NOT notify admins on network issues; just log and retry next cycle.
         if not confirmed:
             logger.warning(f"[{email}] could not confirm inbox due to network issues; will retry next cycle.")
             continue
@@ -358,11 +350,9 @@ async def run_cycle():
             logger.info(f"[{email}] confirmed: no warning.")
             continue
 
-        # WARNING found
         marker = marker or f"warning:{email}:{datetime.now().date().isoformat()}"
         prev = await get_alerted_marker(email)
 
-        # Deduplicate: if same marker already alerted, do nothing
         if prev == marker:
             logger.info(f"[{email}] warning already alerted (marker unchanged).")
             continue
