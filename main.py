@@ -30,10 +30,17 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))  # total re
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))      # sleep between retries
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))                      # scan newest N message links
 
-# ✅ Ignore lines
+# ✅ Ignore lines (old 3 + new ones)
 IGNORE_LINE_1 = os.getenv("IGNORE_LINE_1", "").strip().lower()
 IGNORE_LINE_2 = os.getenv("IGNORE_LINE_2", "").strip().lower()
 IGNORE_LINE_3 = os.getenv("IGNORE_LINE_3", "").strip().lower()
+
+IGNORE_LINE_OTP_1 = os.getenv("IGNORE_LINE_OTP_1", "").strip().lower()
+IGNORE_LINE_OTP_2 = os.getenv("IGNORE_LINE_OTP_2", "").strip().lower()
+IGNORE_LINE_MFA_1 = os.getenv("IGNORE_LINE_MFA_1", "").strip().lower()
+IGNORE_LINE_BILLING_1 = os.getenv("IGNORE_LINE_BILLING_1", "").strip().lower()
+IGNORE_LINE_WORKSPACE_2 = os.getenv("IGNORE_LINE_WORKSPACE_2", "").strip().lower()
+IGNORE_LINE_USAGE_1 = os.getenv("IGNORE_LINE_USAGE_1", "").strip().lower()
 
 # Redis keys (shared between OTP bot and watcher)
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
@@ -83,7 +90,14 @@ def _abs_url(href: str) -> str:
 
 def _ignore_lines() -> List[str]:
     out = []
-    for x in [IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3]:
+    for x in [
+        IGNORE_LINE_1, IGNORE_LINE_2, IGNORE_LINE_3,
+        IGNORE_LINE_OTP_1, IGNORE_LINE_OTP_2,
+        IGNORE_LINE_MFA_1,
+        IGNORE_LINE_BILLING_1,
+        IGNORE_LINE_WORKSPACE_2,
+        IGNORE_LINE_USAGE_1,
+    ]:
         x = (x or "").strip().lower()
         if x:
             out.append(x)
