@@ -26,17 +26,19 @@ RETRY_BUDGET_SECONDS = int(os.getenv("RETRY_BUDGET_SECONDS", "180"))
 RETRY_SLEEP_SECONDS = int(os.getenv("RETRY_SLEEP_SECONDS", "5"))
 SCAN_LAST_N = int(os.getenv("SCAN_LAST_N", "5"))
 
-# Load Ignore Lines
-IGNORE_LINES = [
+# Load and Filter Empty Variables
+RAW_IGNORE_LINES = [
     os.getenv("IGNORE_LINE_1"), os.getenv("IGNORE_LINE_2"), os.getenv("IGNORE_LINE_3"),
     os.getenv("IGNORE_LINE_OTP_1"), os.getenv("IGNORE_LINE_OTP_2"),
     os.getenv("IGNORE_LINE_MFA_1"), os.getenv("IGNORE_LINE_BILLING_1"),
     os.getenv("IGNORE_LINE_WORKSPACE_2"), os.getenv("IGNORE_LINE_USAGE_1")
 ]
+# Only keep non-empty variables
+IGNORE_LINES = [line for line in RAW_IGNORE_LINES if line and line.strip()]
 
 # ---------------- REDIS SETUP ----------------
 if not all([TG_TOKEN, ADMIN_IDS, ALLOWED_DOMAIN, REDIS_URL]):
-    raise SystemExit("ERROR: Missing required env variables (TG_TOKEN, ADMIN_IDS, ALLOWED_DOMAIN, REDIS_URL).")
+    raise SystemExit("ERROR: Missing required env variables.")
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -47,20 +49,17 @@ HEADERS = {
     "Referer": "https://generator.email/",
 }
 
-# ---------------- UTILS ----------------
+# ---------------- KEY HELPER FUNCTIONS ----------------
+
 def _normalize_text(text: str) -> str:
-    """Removes newlines/tabs and squashes multiple spaces into one."""
+    """
+    CRITICAL FIX: Removes all newlines, tabs, and extra spaces.
+    Converts "Hello   \n World" -> "hello world"
+    This ensures your long variables match even if the email has weird formatting.
+    """
     if not text:
         return ""
     return " ".join(text.split()).lower()
-
-def _ignore_phrases() -> List[str]:
-    """Returns a list of cleaned, normalized ignore phrases."""
-    out = []
-    for line in IGNORE_LINES:
-        if line and line.strip():
-            out.append(_normalize_text(line))
-    return out
 
 def _is_allowed_domain(email: str) -> bool:
     email = (email or "").strip().lower()
@@ -106,18 +105,13 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
     selectors = ["email-body", "emailbody", "email_content", "message", "content", "mail"]
     
     for x in selectors:
-        # Try ID
-        node = soup.find(id=x)
-        if node: return node.get_text(" ", strip=True)
-        # Try Class
-        node = soup.find(class_=x)
+        node = soup.find(id=x) or soup.find(class_=x)
         if node: return node.get_text(" ", strip=True)
 
     # 2. Try simple tags if structure is weird
     for tag in ['article', 'pre']:
         nodes = soup.find_all(tag)
         if nodes:
-            # Return the one with the most text
             biggest = max(nodes, key=lambda n: len(n.get_text()))
             return biggest.get_text(" ", strip=True)
 
@@ -128,14 +122,22 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
     return soup.get_text(" ", strip=True)
 
 def _is_ignored(subject: str, body_text: str) -> bool:
-    # Normalize inputs: lowercase, single spaces, no line breaks
-    full_text = _normalize_text(subject + " " + body_text)
+    """
+    Checks if any of your environment variables exist inside the email.
+    Uses 'squash' normalization to ignore newlines and spacing issues.
+    """
+    # 1. Squash the email content into one clean line
+    clean_email_content = _normalize_text(subject + " " + body_text)
     
-    for phrase in _ignore_phrases():
-        if phrase in full_text:
-            return True # Safe! Found a known good phrase.
+    # 2. Check against every variable you set
+    for raw_variable in IGNORE_LINES:
+        # Squash the variable too so formats match
+        clean_variable = _normalize_text(raw_variable)
+        
+        if clean_variable in clean_email_content:
+            return True # ✅ MATCH! It is a known safe email.
             
-    return False # Danger! No safe phrase found.
+    return False # ❌ NO MATCH! It is suspicious.
 
 # ---------------- CHECK LOGIC ----------------
 async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
@@ -160,7 +162,7 @@ async def fetch_message_content(client: httpx.AsyncClient, msg_url: str) -> Tupl
     subject = _extract_subject(r.text)
     soup = BeautifulSoup(r.text, "html.parser")
     
-    # Handle Iframes (common in emails)
+    # Handle Iframes
     iframe = soup.find("iframe", src=True)
     if iframe:
         iframe_url = _abs_url(iframe["src"])
@@ -179,9 +181,6 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
 
         for msg_url in links:
             subject, body, final_url = await fetch_message_content(client, msg_url)
-            
-            # DEBUG LOG: Verify what the bot is reading
-            # logger.info(f"Checking {email} | Subj: {subject[:20]}... | Found Safe Keyword? {_is_ignored(subject, body)}")
 
             if _is_ignored(subject, body):
                 continue # This email is safe
@@ -222,10 +221,10 @@ async def run_cycle():
             
         # HANDLE WARNING
         today = datetime.now().date().isoformat()
-        marker = f"warning:{email}:{today}" # One alert per day per email
+        marker = f"warning:{email}:{today}" 
         
         if await redis_client.get(f"warn:alerted:{email}") == marker:
-            continue # Already alerted today
+            continue 
 
         msg = (
             f"🚨 <b>ACCOUNT WARNING</b> 🚨\n"
