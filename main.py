@@ -114,6 +114,11 @@ async def _sleep(seconds: int):
     import asyncio
     await asyncio.sleep(seconds)
 
+# ✅ NEW: normalize helper (only for matching)
+def _normalize_text(s: str) -> str:
+    # lower + collapse whitespace so HTML/newlines won't break matching
+    return " ".join((s or "").lower().split())
+
 
 # ---------------- Telegram send (NO polling) ----------------
 async def tg_send_message(text: str, chat_id: int) -> bool:
@@ -233,11 +238,31 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
 
     return soup.get_text(" ", strip=True)
 
+# ✅ FIXED: ignore matching rules
 def _is_ignored(body_text: str) -> bool:
-    t = (body_text or "").lower()
-    for line in _ignore_lines():
-        if line and line in t:
+    text = _normalize_text(body_text)
+
+    # ✅ STRICT exact-phrase match for usage-limit ignore line.
+    # This prevents partial/random words from triggering ignore.
+    usage_phrase = _normalize_text(IGNORE_LINE_USAGE_1)
+    if usage_phrase and usage_phrase in text:
+        return True
+
+    # ✅ Normal matching for the rest (still phrase-based, but not strict word-by-word)
+    for line in [
+        IGNORE_LINE_1,
+        IGNORE_LINE_2,
+        IGNORE_LINE_3,
+        IGNORE_LINE_OTP_1,
+        IGNORE_LINE_OTP_2,
+        IGNORE_LINE_MFA_1,
+        IGNORE_LINE_BILLING_1,
+        IGNORE_LINE_WORKSPACE_2,
+    ]:
+        phrase = _normalize_text(line)
+        if phrase and phrase in text:
             return True
+
     return False
 
 async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
