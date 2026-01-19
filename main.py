@@ -1,7 +1,6 @@
 import os
 import time
 import logging
-import hashlib
 from datetime import datetime
 from typing import Optional, List, Tuple
 
@@ -45,7 +44,7 @@ IGNORE_LINE_USAGE_1 = os.getenv("IGNORE_LINE_USAGE_1", "").strip().lower()
 # Redis keys (shared between OTP bot and watcher)
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
 INTERVAL_KEY = "warn:interval_min"        # Redis STRING interval minutes
-ALERTED_PREFIX = "warn:alerted:"          # Redis SET per email storing fingerprints
+ALERTED_PREFIX = "warn:alerted:"          # Redis STRING per email storing last alerted marker
 
 # ---------------- Validation ----------------
 if not TG_TOKEN:
@@ -103,21 +102,9 @@ def _ignore_lines() -> List[str]:
             out.append(x)
     return out
 
-def _fingerprint(subject: str, body_text: str) -> str:
-    # stable per email content
-    s = (subject or "").strip().lower()
-    b = (body_text or "").strip().lower()
-    raw = (s + "\n" + b).encode("utf-8", errors="ignore")
-    return hashlib.sha256(raw).hexdigest()[:24]
-
 async def _sleep(seconds: int):
     import asyncio
     await asyncio.sleep(seconds)
-
-# ✅ NEW: normalize helper (only for matching)
-def _normalize_text(s: str) -> str:
-    # lower + collapse whitespace so HTML/newlines won't break matching
-    return " ".join((s or "").lower().split())
 
 
 # ---------------- Telegram send (NO polling) ----------------
@@ -163,23 +150,11 @@ async def get_watchlist() -> List[str]:
             out.append(e)
     return out
 
-async def fingerprint_already_alerted(email: str, fp: str) -> bool:
-    if not fp:
-        return False
-    key = ALERTED_PREFIX + email
-    try:
-        return bool(await redis_client.sismember(key, fp))
-    except Exception:
-        return False
+async def get_alerted_marker(email: str) -> Optional[str]:
+    return await redis_client.get(ALERTED_PREFIX + email)
 
-async def store_alerted_fingerprint(email: str, fp: str):
-    if not fp:
-        return
-    key = ALERTED_PREFIX + email
-    try:
-        await redis_client.sadd(key, fp)
-    except Exception:
-        pass
+async def set_alerted_marker(email: str, marker: str):
+    await redis_client.set(ALERTED_PREFIX + email, marker)
 
 
 # ---------------- generator.email scraping ----------------
@@ -189,9 +164,8 @@ def _extract_subject(html: str) -> str:
 
 def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
     """
-    ✅ CRITICAL FIX:
-    generator.email inbox pages contain sidebar/table with OTHER subjects.
-    We must extract ONLY the email body container, not whole page text.
+    generator.email pages contain sidebar/table with OTHER subjects.
+    We try hard to extract ONLY the email body container.
     """
     selectors = [
         {"id": "email-body"},
@@ -202,12 +176,15 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         {"id": "emailMessage"},
         {"id": "mail"},
         {"id": "content"},
+        {"id": "message"},
     ]
 
     for sel in selectors:
         node = soup.find(id=sel["id"])
         if node:
-            return node.get_text(" ", strip=True)
+            txt = node.get_text(" ", strip=True)
+            if txt:
+                return txt
 
     class_candidates = [
         "email-body",
@@ -216,12 +193,16 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         "message-body",
         "mailview",
         "content",
+        "message",
     ]
     for cls in class_candidates:
         node = soup.find(class_=cls)
         if node:
-            return node.get_text(" ", strip=True)
+            txt = node.get_text(" ", strip=True)
+            if txt:
+                return txt
 
+    # Fallback: biggest <pre>
     pres = soup.find_all("pre")
     if pres:
         biggest = max(pres, key=lambda x: len(x.get_text(" ", strip=True)))
@@ -229,6 +210,7 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         if txt:
             return txt
 
+    # Fallback: biggest <article>
     articles = soup.find_all("article")
     if articles:
         biggest = max(articles, key=lambda x: len(x.get_text(" ", strip=True)))
@@ -236,33 +218,17 @@ def _extract_email_body_text_from_page(soup: BeautifulSoup) -> str:
         if txt:
             return txt
 
-    return soup.get_text(" ", strip=True)
+    # LAST resort: return empty instead of whole page
+    # because whole-page text includes sidebar and causes false ignores.
+    return ""
 
-# ✅ FIXED: ignore matching rules
 def _is_ignored(body_text: str) -> bool:
-    text = _normalize_text(body_text)
-
-    # ✅ STRICT exact-phrase match for usage-limit ignore line.
-    # This prevents partial/random words from triggering ignore.
-    usage_phrase = _normalize_text(IGNORE_LINE_USAGE_1)
-    if usage_phrase and usage_phrase in text:
-        return True
-
-    # ✅ Normal matching for the rest (still phrase-based, but not strict word-by-word)
-    for line in [
-        IGNORE_LINE_1,
-        IGNORE_LINE_2,
-        IGNORE_LINE_3,
-        IGNORE_LINE_OTP_1,
-        IGNORE_LINE_OTP_2,
-        IGNORE_LINE_MFA_1,
-        IGNORE_LINE_BILLING_1,
-        IGNORE_LINE_WORKSPACE_2,
-    ]:
-        phrase = _normalize_text(line)
-        if phrase and phrase in text:
+    t = (body_text or "").lower()
+    if not t:
+        return False
+    for line in _ignore_lines():
+        if line and line in t:
             return True
-
     return False
 
 async def fetch_inbox_message_links(client: httpx.AsyncClient, email: str) -> List[str]:
@@ -298,6 +264,7 @@ async def fetch_message_subject_and_body(client: httpx.AsyncClient, inbox_url: s
     subject = _extract_subject(r.text)
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # If message page has iframe, pull iframe and extract body from that
     iframe = soup.find("iframe", src=True)
     if iframe and iframe.get("src"):
         iframe_url = _abs_url(iframe["src"].strip())
@@ -308,15 +275,20 @@ async def fetch_message_subject_and_body(client: httpx.AsyncClient, inbox_url: s
         body_text = _extract_email_body_text_from_page(iframe_soup)
         return subject, body_text, final_url
 
+    # Otherwise extract body from this page (body container only)
     body_text = _extract_email_body_text_from_page(soup)
     return subject, body_text, final_url
 
 
-async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    Returns:
-      ("WARNING", inbox_url, subject, fingerprint)
-      ("NO_WARNING", None, None, None)
+    YOUR REQUIRED LOGIC:
+
+    - Open inbox
+    - Take first SCAN_LAST_N emails
+    - Open each and read BODY ONLY
+    - If ALL of them match ignore lines => NO_WARNING
+    - If ANY of them does NOT match ignore lines => WARNING
     """
     inbox_url = f"https://generator.email/{email}"
 
@@ -324,7 +296,7 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
         links = await fetch_inbox_message_links(client, email)
 
         if not links:
-            return "NO_WARNING", None, None, None
+            return "NO_WARNING", None, None
 
         for msg_url in links:
             subject, body_text, final_url = await fetch_message_subject_and_body(client, inbox_url, msg_url)
@@ -333,22 +305,18 @@ async def check_email_once(email: str) -> Tuple[str, Optional[str], Optional[str
                 logger.info(f"[{email}] ignored email matched ignore lines (subject='{subject}').")
                 continue
 
-            fp = _fingerprint(subject, body_text)
+            # ✅ Found one email among first N that is NOT ignored => WARNING
+            return "WARNING", final_url, subject
 
-            # ✅ If this exact issue email already alerted, skip it
-            if await fingerprint_already_alerted(email, fp):
-                logger.info(f"[{email}] already alerted same issue email (subject='{subject}').")
-                continue
+        # ✅ If we reached here: ALL first N emails were ignored
+        logger.info(f"[{email}] all first {len(links)} emails matched ignore lines. NO WARNING.")
+        return "NO_WARNING", None, None
 
-            # ✅ First non-ignored + not-seen email among top N => WARNING
-            return "WARNING", inbox_url, subject, fp
 
-        return "NO_WARNING", None, None, None
-
-async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], Optional[str], Optional[str]]:
+async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """
     Returns:
-      confirmed, status, inbox_url, subject, fingerprint
+      confirmed, status, marker, subject
     If confirmed=False => UNCONFIRMED (network issues exceeded budget)
     """
     start = time.time()
@@ -357,14 +325,14 @@ async def check_email_with_retry(email: str) -> Tuple[bool, str, Optional[str], 
     while True:
         attempt += 1
         try:
-            status, inbox_url, subject, fp = await check_email_once(email)
-            return True, status, inbox_url, subject, fp
+            status, marker, subject = await check_email_once(email)
+            return True, status, marker, subject
         except httpx.HTTPError as e:
             elapsed = time.time() - start
             logger.warning(f"[{email}] network error attempt={attempt}: {e}")
 
             if elapsed >= RETRY_BUDGET_SECONDS:
-                return False, "UNCONFIRMED", None, None, None
+                return False, "UNCONFIRMED", None, None
 
             await _sleep(RETRY_SLEEP_SECONDS)
 
@@ -379,9 +347,9 @@ async def run_cycle():
     logger.info(f"Cycle start: checking {len(emails)} inbox(es).")
 
     for email in emails:
-        confirmed, status, inbox_url, subject, fp = await check_email_with_retry(email)
+        confirmed, status, marker, subject = await check_email_with_retry(email)
 
-        # ✅ Do NOT notify admins on network issues; just log and retry next cycle.
+        # Do NOT notify admins on network issues; just log and retry next cycle.
         if not confirmed:
             logger.warning(f"[{email}] could not confirm inbox due to network issues; will retry next cycle.")
             continue
@@ -390,21 +358,29 @@ async def run_cycle():
             logger.info(f"[{email}] confirmed: no warning.")
             continue
 
-        # WARNING found (new issue email)
+        # WARNING found
+        marker = marker or f"warning:{email}:{datetime.now().date().isoformat()}"
+        prev = await get_alerted_marker(email)
+
+        # Deduplicate: if same marker already alerted, do nothing
+        if prev == marker:
+            logger.info(f"[{email}] warning already alerted (marker unchanged).")
+            continue
+
         subj_line = f"🧾 Subject: {subject}\n" if subject else ""
+        inbox_link = f"https://generator.email/{email}"
+
         msg = (
             "🚨 ACCOUNT WARNING DETECTED 🚨\n"
             f"📧 {email}\n"
             f"{subj_line}"
-            f"🔗 Inbox: {inbox_url}\n"
+            f"🔗 Inbox: {inbox_link}\n"
+            f"🔗 Message: {marker}\n"
             f"🕒 {datetime.now().isoformat()}"
         ).strip()
 
         await alert_admins(msg)
-
-        # ✅ store fingerprint so same issue email will NOT alert again
-        await store_alerted_fingerprint(email, fp)
-
+        await set_alerted_marker(email, marker)
         logger.info(f"[{email}] alerted admins.")
 
 
